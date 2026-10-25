@@ -7,6 +7,18 @@ const path = require('node:path');
 const { FileStore } = require('../../src/backend/file-store.cjs');
 const { CORE_KEY, META_KEY, buildKeyBox, cryptAudioChunk } = require('../../src/backend/ncm-decoder.cjs');
 
+test('直接下载的 FLAC 保留正确格式和文件扩展名', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cloudmusic-flac-'));
+  t.after(() => { assert.ok(path.basename(root).startsWith('cloudmusic-flac-')); fs.rmSync(root, { recursive: true, force: true }); });
+  const audio = Buffer.concat([Buffer.from('fLaC'), Buffer.alloc(100)]);
+  const downloaded = await new FileStore(root).downloadTrack({ id: '9', name: 'Lossless', artists: ['Artist'] }, new Response(audio), {
+    waitIfPaused: async () => {}, throwIfCancelled: () => {}
+  });
+  assert.equal(downloaded.extension, 'flac');
+  assert.match(downloaded.filename, /\.flac$/);
+  assert.deepEqual(fs.readFileSync(downloaded.entityPath), audio);
+});
+
 test('内置 NCM 解码器将 VIP 歌曲纯解码为标准 MP3，并保留容器封面与元数据', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cloudmusic-ncm-'));
   t.after(() => {

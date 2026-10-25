@@ -35,7 +35,7 @@ test('从在线歌单到 SQLite、实体文件和歌单硬链接的完整同步'
 
   const setup = await service.setupUser('123456789');
   assert.equal(setup.online.length, 3);
-  const result = await service.addLocal(['1001']);
+  const result = await selectExisting(service, ['1001']);
   assert.equal(result.local[0].added.length, 2);
   assert.equal(fs.existsSync(path.join(root, '夜航测试集')), true);
 
@@ -101,9 +101,10 @@ test('从在线歌单到 SQLite、实体文件和歌单硬链接的完整同步'
   await service.changeLibrary(resetRoot, false);
   assert.equal(fs.readdirSync(path.join(migratedRoot, 'songs')).length, 2, '不迁移时旧音乐保留');
   assert.equal(fs.readdirSync(path.join(resetRoot, 'songs')).length, 0);
-  assert.equal(service.localPlaylists()[0].status, 'pending');
+  assert.equal(service.localPlaylists()[0].status, 'offline');
   await service.scan();
-  assert.equal(service.localPlaylists()[0].added.length, 2);
+  assert.equal(service.localPlaylists()[0].added.length, 0);
+  assert.equal(fs.existsSync(path.join(resetRoot, '夜航测试集')), false, '切换音乐库不能自动创建占位歌单目录');
 
   service.setLocalPaused([local.id], true);
   assert.equal(service.localPlaylists()[0].status, 'paused');
@@ -128,7 +129,7 @@ test('删除歌单曲目后只清理不再属于任何本地歌单的歌曲实�
   t.after(() => service.stop());
 
   await service.setupUser('123456789');
-  await service.addLocal(['1001']);
+  await selectExisting(service, ['1001']);
   service.startSync();
   await waitFor(() => !tasks.active);
 
@@ -137,6 +138,7 @@ test('删除歌单曲目后只清理不再属于任何本地歌单的歌曲实�
   const sharedId = 'local-shared-track';
   db.run(`INSERT INTO local_playlists(id,online_id,name,folder_name,created_at,track_count,added_at,added_json,removed_json,existing_json)
     VALUES (?,?,?,?,?,?,?,?,?,?)`, [sharedId, 'shared', '共享曲目歌单', '共享曲目歌单', 0, 1, Date.now(), '[]', '[]', '[]']);
+  fs.mkdirSync(path.join(root, '共享曲目歌单'));
   await store.createPlaylistLink(sharedSong.entity_path, '共享曲目歌单', path.basename(sharedSong.entity_path));
   db.run('INSERT INTO playlist_tracks(playlist_id,track_id,filename,linked_at) VALUES (?,?,?,?)', [sharedId, '501', path.basename(sharedSong.entity_path), Date.now()]);
 
@@ -178,7 +180,7 @@ test('自动扫描和实时同步复用可见任务状态，新添加歌单会�
   t.after(() => service.stop());
 
   await service.setupUser('123456789');
-  await service.addLocal(['1001']);
+  await selectExisting(service, ['1001']);
   const automaticCycle = service.runAutomaticCycle('auto', true);
   assert.equal(service.bootstrap().scanning, true);
   assert.equal(service.bootstrap().scanSource, 'auto');
@@ -191,7 +193,7 @@ test('自动扫描和实时同步复用可见任务状态，新添加歌单会�
   await waitFor(() => !tasks.active);
 
   db.setSettings({ realtimeSync: true });
-  const added = await service.addLocal(['1002']);
+  const added = await selectExisting(service, ['1002']);
   assert.equal(added.added.length, 1);
   assert.equal(tasks.getState().active, true);
   assert.equal(tasks.getState().source, 'realtime');
@@ -247,7 +249,7 @@ test('首次修改音乐库会清理空默认目录，登录与启动扫描都�
   restarted.stop();
 });
 
-test('首次设置和后续切换音乐库会自动识别在线歌单同名文件夹', async (t) => {
+test('明确选择后识别同名目录，切换音乐库不能创建缺失歌单目录', async (t) => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'ncmsync-discovery-'));
   const defaultRoot = path.join(base, 'default-library');
   const selectedRoot = path.join(base, 'selected-library');
@@ -278,14 +280,17 @@ test('首次设置和后续切换音乐库会自动识别在线歌单同名文�
 
   await service.changeLibrary(selectedRoot, false, true);
   const setup = await service.setupUser('123456789');
-  assert.match(setup.scanStatus, /识别 1 个本地歌单/);
-  assert.equal(setup.local.length, 1);
-  assert.equal(setup.local[0].onlineId, '1001');
-  assert.equal(setup.local[0].folderName, '夜航测试集');
-  assert.deepEqual(setup.local[0].existing.map((track) => track.name), ['Neon Run']);
-  assert.deepEqual(setup.local[0].added.map((track) => track.name), ['Last Train']);
+  assert.equal(setup.local.length, 0, '首次设置只获取歌单列表');
+  service.setSyncSelection(['1001', '1002']);
+  await service.scanAll();
+  const selected = service.bootstrap();
+  assert.equal(selected.local.length, 1);
+  assert.equal(selected.local[0].onlineId, '1001');
+  assert.equal(selected.local[0].folderName, '夜航测试集');
+  assert.deepEqual(selected.local[0].existing.map((track) => track.name), ['Neon Run']);
+  assert.deepEqual(selected.local[0].added.map((track) => track.name), ['Last Train']);
   assert.equal(fs.readdirSync(path.join(selectedRoot, 'songs')).length, 1, '识别出的歌曲应被吸收到实体库');
-  assert.equal(setup.local.some((playlist) => playlist.folderName === '与歌单无关的文件夹'), false);
+  assert.equal(selected.local.some((playlist) => playlist.folderName === '与歌单无关的文件夹'), false);
 
   const changed = await service.changeLibrary(nextRoot, false);
   assert.match(changed.scanStatus, /已识别 1 个本地歌单/);
@@ -294,7 +299,7 @@ test('首次设置和后续切换音乐库会自动识别在线歌单同名文�
   assert.ok(saved);
   assert.equal(saved.status, 'synced');
   assert.deepEqual(saved.existing.map((track) => track.name), ['Saved Groove']);
-  assert.equal(fs.existsSync(path.join(nextRoot, '夜航测试集')), true, '没有现有文件夹的原本地歌单仍应保留空目录占位');
+  assert.equal(fs.existsSync(path.join(nextRoot, '夜航测试集')), false, '没有现有文件夹的原本地歌单不能创建空目录占位');
 });
 
 test('单曲下载失败时跳过该曲目并继续下载其余歌曲', async (t) => {
@@ -319,7 +324,7 @@ test('单曲下载失败时跳过该曲目并继续下载其余歌曲', async (t
   t.after(() => service.stop());
 
   await service.setupUser('123456789');
-  await service.addLocal(['1001']);
+  await selectExisting(service, ['1001']);
   service.startSync();
   await waitFor(() => !tasks.active);
 
@@ -351,11 +356,20 @@ test('设置中的下载并发数会应用到下次同步', async (t) => {
   service.updateSettings({ downloadConcurrency: 6 });
   assert.equal(service.downloadConcurrency, 6);
   await service.setupUser('123456789');
-  await service.addLocal(['1001']);
+  await selectExisting(service, ['1001']);
   const task = service.startSync();
   assert.equal(task.concurrency, 6, '下次同步应使用设置中的并发');
   await waitFor(() => !tasks.active);
 });
+
+async function selectExisting(service, ids) {
+  service.setSyncSelection([...service.selectedOnlineIds(), ...ids]);
+  for (const id of ids) {
+    const row = service.onlinePlaylists().find((item) => item.id === id);
+    fs.mkdirSync(path.join(service.rootPath, row.name), { recursive: true });
+  }
+  return service.addLocal(ids);
+}
 
 async function waitFor(predicate, timeout = 5000) {
   const started = Date.now();

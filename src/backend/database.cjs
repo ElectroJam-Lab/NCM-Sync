@@ -6,6 +6,7 @@ class Database {
   constructor(filePath) {
     this.filePath = filePath;
     this.db = null;
+    this.revision = 0;
   }
 
   async init() {
@@ -74,14 +75,30 @@ class Database {
         FOREIGN KEY (track_id) REFERENCES songs(track_id) ON DELETE CASCADE
       );
       CREATE INDEX IF NOT EXISTS idx_playlist_tracks_track ON playlist_tracks(track_id);
+      CREATE TABLE IF NOT EXISTS track_choices (
+        playlist_id TEXT NOT NULL,
+        track_id TEXT NOT NULL,
+        action TEXT NOT NULL CHECK(action IN ('add','remove','keep')),
+        PRIMARY KEY (playlist_id, track_id),
+        FOREIGN KEY (playlist_id) REFERENCES local_playlists(id) ON DELETE CASCADE
+      );
     `);
     this.migrateSongs();
+    const localColumns = new Set(this.all('PRAGMA table_info(local_playlists)').map((row) => row.name));
+    if (!localColumns.has('custom_mapping')) this.db.run('ALTER TABLE local_playlists ADD COLUMN custom_mapping INTEGER NOT NULL DEFAULT 0');
+    if (!localColumns.has('online_tracks_json')) this.db.run("ALTER TABLE local_playlists ADD COLUMN online_tracks_json TEXT NOT NULL DEFAULT '[]'");
+    const choiceColumns = new Set(this.all('PRAGMA table_info(track_choices)').map((row) => row.name));
+    if (!choiceColumns.has('enabled')) {
+      this.db.run('ALTER TABLE track_choices ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1');
+      this.db.run(`UPDATE track_choices SET enabled=0 WHERE action<>'add' AND NOT EXISTS
+        (SELECT 1 FROM playlist_tracks pt WHERE pt.playlist_id=track_choices.playlist_id AND pt.track_id=track_choices.track_id)`);
+    }
     const defaults = {
       userId: '', initialized: false, autoScan: false, autoSync: false, realtimeSync: false,
-      scanHours: 1, scanMinutes: 0, deleteRemoved: false, downloadConcurrency: 4,
+      scanHours: 1, scanMinutes: 0, deleteRemoved: false, downloadConcurrency: 4, mp3Bitrate: 0,
       renamePolicy: 'ask', cancelDeleteDownloaded: false,
       cancelDontAsk: false, removeLocalDontAsk: false, cookie: '', interruptedTask: false,
-      lastGlobalStatus: '', libraryPath: '', lastScanAt: null, lastSyncAt: null
+      lastGlobalStatus: '', libraryPath: '', lastScanAt: null, lastSyncAt: null, syncPlaylistIds: []
     };
     for (const [key, value] of Object.entries(defaults)) {
       this.db.run('INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)', [key, JSON.stringify(value)]);
@@ -110,6 +127,7 @@ class Database {
 
   run(sql, params = [], save = true) {
     this.db.run(sql, params);
+    this.revision += 1;
     if (save) this.save();
   }
 
@@ -130,6 +148,7 @@ class Database {
     try {
       const result = callback();
       this.db.run('COMMIT');
+      this.revision += 1;
       this.save();
       return result;
     } catch (error) {

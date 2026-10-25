@@ -4,6 +4,7 @@ const { createServer } = require('../../src/backend/server.cjs');
 
 test('本地 API 设置安全响应头并拒绝跨来源写操作', async (t) => {
   const service = {
+    bootstrapRevision: () => 'unchanged',
     bootstrap: () => ({ ok: true }),
     dismissSetup: () => ({ initialized: true })
   };

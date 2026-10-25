@@ -1,9 +1,12 @@
 const express = require('express');
 const path = require('node:path');
+const { createHash, randomUUID } = require('node:crypto');
 
 function createServer({ service, staticPath, port = 0, rendererOrigin = '' }) {
   const app = express();
   const allowedOrigins = new Set();
+  const sessionId = randomUUID();
+  let bootstrapCache;
   app.disable('x-powered-by');
   app.use((req, res, next) => {
     res.setHeader('Content-Security-Policy', "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'");
@@ -16,14 +19,28 @@ function createServer({ service, staticPath, port = 0, rendererOrigin = '' }) {
   });
   app.use(express.json({ limit: '1mb' }));
 
-  app.get('/api/bootstrap', (_req, res) => res.json(service.bootstrap()));
+  app.get('/api/bootstrap', (req, res) => {
+    const revision = service.bootstrapRevision();
+    if (bootstrapCache?.revision !== revision) {
+      const etag = `"${createHash('sha256').update(sessionId + revision).digest('hex')}"`;
+      bootstrapCache = { revision, etag, body: JSON.stringify(service.bootstrap({ summary: true })) };
+    }
+    res.setHeader('ETag', bootstrapCache.etag);
+    res.setHeader('Cache-Control', 'private, no-cache');
+    if (req.get('if-none-match') === bootstrapCache.etag) return res.status(304).end();
+    return res.type('json').send(bootstrapCache.body);
+  });
+  app.get('/api/local/:id', asyncHandler(async (req, res) => res.json(service.localDetail(req.params.id))));
+  app.post('/api/local/map', asyncHandler(async (req, res) => res.json(await service.mapPlaylist(req.body.onlineId, req.body.folderPath, req.body.localId))));
+  app.put('/api/local/:id/choices', asyncHandler(async (req, res) => res.json(await service.saveTrackChoices(req.params.id, req.body.revision, req.body.changes))));
   app.post('/api/setup', asyncHandler(async (req, res) => res.json(await service.setupUser(req.body.userId, Boolean(req.body.changing)))));
   app.post('/api/setup/later', (_req, res) => res.json(service.dismissSetup()));
   app.post('/api/online/refresh', asyncHandler(async (_req, res) => res.json({ online: await service.refreshOnline() })));
   app.get('/api/online/:id', asyncHandler(async (req, res) => res.json(await service.playlistDetail(req.params.id))));
   app.post('/api/local', asyncHandler(async (req, res) => res.json(await service.addLocal(req.body.onlineIds))));
   app.post('/api/scan', asyncHandler(async (_req, res) => res.json(await service.scanAll())));
-  app.post('/api/sync', asyncHandler(async (req, res) => { res.status(202).json(service.startSync(req.body.ids)); }));
+  app.put('/api/sync/selection', asyncHandler(async (req, res) => res.json(service.setSyncSelection(req.body.onlineIds))));
+  app.post('/api/sync', asyncHandler(async (req, res) => { res.status(202).json(await service.syncSelected(req.body.ids)); }));
   app.post('/api/local/pause', asyncHandler(async (req, res) => res.json({ local: service.setLocalPaused(req.body.ids, req.body.paused) })));
   app.post('/api/local/remove', asyncHandler(async (req, res) => res.json({ local: await service.removeLocal(req.body.ids) })));
   app.post('/api/local/:id/redirect', asyncHandler(async (req, res) => res.json({ local: await service.redirectLocal(req.params.id, req.body.onlineId) })));

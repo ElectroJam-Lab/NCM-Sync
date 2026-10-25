@@ -11,6 +11,6 @@ export function sortRows(rows, sort) {
 
 export function sortValue(row, key) {
   if (key === 'status') return STATUS_ORDER[row.status] ?? 4;
-  if (key === 'updateCount') return (row.added?.length || 0) + (row.removed?.length || 0);
+  if (key === 'updateCount') return (row.addedCount ?? row.added?.length ?? 0) + (row.removedCount ?? row.removed?.length ?? 0);
   return row[key] ?? '';
 }

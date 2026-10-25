@@ -2,6 +2,9 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client';
 import { api } from './api.js';
 import { sortRows } from './sorting.mjs';
+import { PlaylistEditor, MappingModal } from './playlist-editor.jsx';
+import { useVirtualWindow } from './use-virtual-window.jsx';
+import { reconcileSnapshot } from './snapshot.mjs';
 import './styles.css';
 import logoUrl from '../../assets/ncmsync-logo-256.png';
 
@@ -30,22 +33,45 @@ function App() {
   const [context, setContext] = useState(null);
   const onlineAnchor = useRef(null);
   const localAnchor = useRef(null);
+  const pendingScope = useRef(null);
+  const inFlight = useRef(null);
+  const toastTimer = useRef(null);
 
-  const load = useCallback(async (quiet = false) => {
+  const load = useCallback(async (quiet = false, fresh = false) => {
+    if (inFlight.current) {
+      if (!fresh) return inFlight.current;
+      await inFlight.current;
+    }
+    const reading = (async () => {
     try {
       const next = await api.bootstrap();
-      setData(next);
+      const scoped = pendingScope.current ? { ...next, settings: { ...next.settings, syncPlaylistIds: pendingScope.current } } : next;
+      setData((old) => reconcileSnapshot(old, scoped));
       if (!quiet && !next.initialized) setModal({ type: 'setup' });
     } catch (error) { notify(error.message, 'error'); }
     finally { setLoading(false); }
+    })();
+    inFlight.current = reading;
+    try { return await reading; }
+    finally { if (inFlight.current === reading) inFlight.current = null; }
   }, []);
 
   useEffect(() => { load(); }, [load]);
   useEffect(() => {
     if (!data) return undefined;
-    const delay = data.task.active || data.scanning || data.settings.realtimeSync ? 500 : 1_200;
-    const timer = setInterval(() => load(true), delay);
-    return () => clearInterval(timer);
+    const delay = data.task.active || data.scanning ? 500 : data.settings.realtimeSync ? 1_200 : 2_500;
+    let timer; let stopped = false; let running = false;
+    const poll = async () => {
+      if (running || stopped) return;
+      running = true;
+      if (!document.hidden) await load(true);
+      running = false;
+      if (!stopped) timer = setTimeout(poll, document.hidden ? 10_000 : delay);
+    };
+    const visible = () => { if (!document.hidden) { clearTimeout(timer); poll(); } };
+    timer = setTimeout(poll, delay);
+    document.addEventListener('visibilitychange', visible);
+    return () => { stopped = true; clearTimeout(timer); document.removeEventListener('visibilitychange', visible); };
   }, [data?.task.active, data?.scanning, data?.settings.realtimeSync, load]);
   useEffect(() => {
     const close = () => setContext(null);
@@ -54,15 +80,16 @@ function App() {
   }, []);
 
   function notify(message, type = 'success') {
+    clearTimeout(toastTimer.current);
     setToast({ message, type });
-    setTimeout(() => setToast(null), 3800);
+    toastTimer.current = setTimeout(() => setToast(null), 3800);
   }
 
   async function action(name, fn, success) {
     setBusy(name);
     try {
       const result = await fn();
-      await load(true);
+      await load(true, true);
       if (success) notify(typeof success === 'function' ? success(result) : success);
       return result;
     } catch (error) { notify(error.message, 'error'); return null; }
@@ -72,16 +99,19 @@ function App() {
   const onlineCounts = useMemo(() => ({
     created: (data?.online || []).filter((item) => item.kind === 'created').length,
     saved: (data?.online || []).filter((item) => item.kind === 'saved').length
-  }), [data]);
+  }), [data?.online]);
+  const syncScope = useMemo(() => new Set(data?.settings.syncPlaylistIds || []), [data?.settings.syncPlaylistIds]);
   const onlineSelectedCounts = useMemo(() => ({
-    created: (data?.online || []).filter((item) => item.kind === 'created' && onlineSelected.has(item.id)).length,
-    saved: (data?.online || []).filter((item) => item.kind === 'saved' && onlineSelected.has(item.id)).length
-  }), [data, onlineSelected]);
+    created: (data?.online || []).filter((item) => item.kind === 'created' && syncScope.has(item.id)).length,
+    saved: (data?.online || []).filter((item) => item.kind === 'saved' && syncScope.has(item.id)).length
+  }), [data?.online, syncScope]);
   const onlineRows = useMemo(() => sortRows((data?.online || [])
     .filter((item) => item.kind === onlineTab)
-    .filter((item) => item.name.toLowerCase().includes(onlineSearch.toLowerCase())), onlineSort), [data, onlineTab, onlineSearch, onlineSort]);
+    .filter((item) => item.name.toLowerCase().includes(onlineSearch.toLowerCase())), onlineSort), [data?.online, onlineTab, onlineSearch, onlineSort]);
   const localRows = useMemo(() => sortRows((data?.local || [])
-    .filter((item) => item.displayName.toLowerCase().includes(localSearch.toLowerCase())), localSort), [data, localSearch, localSort]);
+    .filter((item) => `${item.displayName} ${item.folderPath}`.toLowerCase().includes(localSearch.toLowerCase())), localSort), [data?.local, localSearch, localSort]);
+  const mappedOnlineIds = useMemo(() => new Set((data?.local || []).filter((row) => !row.offline).map((row) => row.onlineId)), [data?.local]);
+  const onlineWindow = useVirtualWindow(onlineRows.length, 60, `${onlineTab}:${onlineSearch}:${onlineSort.key}:${onlineSort.direction}`, 36);
 
   function toggleSelection(event, item, rows, selected, setSelected, anchorRef) {
     const next = new Set(event.ctrlKey ? selected : []);
@@ -102,12 +132,18 @@ function App() {
   }
 
   async function showOnlineDetail(item) {
+    const mapped = data.local.find((row) => row.onlineId === item.id);
+    if (mapped) return showLocalDetail(mapped);
     setModal({ type: 'loading', title: item.name });
     const detail = await action('detail', () => api.detail(item.id));
     if (detail) setModal({ type: 'tracks', title: item.name, tracks: detail.tracks }); else setModal(null);
   }
 
-  function showLocalDetail(item) { setModal({ type: 'changes', itemId: item.id }); }
+  async function showLocalDetail(item) {
+    setModal({ type: 'loading', title: item.displayName });
+    const detail = await action('local-detail', () => api.localDetail(item.id));
+    setModal(detail ? { type: 'changes', item: detail } : null);
+  }
 
   async function setupUser({ userId, libraryPath }, later = false) {
     if (libraryPath && libraryPath !== data.rootPath) {
@@ -124,9 +160,19 @@ function App() {
 
   async function scan() { await action('scan', api.scan, '扫描更新完成'); }
   async function addSelected() {
-    if (!onlineSelected.size) return;
-    const result = await action('add', () => api.addLocal([...onlineSelected]), `已添加 ${onlineSelected.size} 个歌单`);
-    if (result) setOnlineSelected(new Set());
+    if (!syncScope.size) return;
+    await action('add', () => api.addLocal([...syncScope]), (result) => result.unmatched.length
+      ? `已匹配 ${result.added.length} 个歌单；${result.unmatched.length} 个未找到目录，请自定义映射`
+      : `已匹配 ${result.added.length} 个歌单`);
+  }
+  async function choosePlaylists(ids, enabled) {
+    const next = new Set(syncScope);
+    for (const id of ids) if (enabled) next.add(id); else next.delete(id);
+    pendingScope.current = [...next];
+    setData((old) => ({ ...old, settings: { ...old.settings, syncPlaylistIds: pendingScope.current } }));
+    const result = await action('selection', () => api.selectPlaylists([...next]));
+    pendingScope.current = null;
+    if (!result) await load(true);
   }
   async function sync(ids) { await action('sync', () => api.sync(ids), '同步任务已开始'); }
   async function toggleRealtime(enabled) { await action('realtime', () => api.saveSettings({ realtimeSync: enabled }), enabled ? '实时同步已开启' : '实时同步已关闭'); }
@@ -136,15 +182,19 @@ function App() {
     await action('pause-local', () => api.pauseLocal([...localSelected], shouldPause), shouldPause ? '歌单已暂停' : '歌单已恢复');
   }
   function confirmRemove(ids = [...localSelected]) {
+    const includesLibrary = data.local.some((row) => ids.includes(row.id) && row.libraryRoot);
+    const onlyLibrary = includesLibrary && ids.length === 1;
     const remove = async (dontAsk = false) => {
       if (dontAsk) await api.saveSettings({ removeLocalDontAsk: true, scanHours: data.settings.scanHours, scanMinutes: data.settings.scanMinutes });
         await action('remove', () => api.removeLocal(ids), '本地歌单已移除');
         setLocalSelected(new Set()); setModal(null);
     };
     if (data.settings.removeLocalDontAsk) { remove(); return; }
-    setModal({ type: 'confirm', title: '删除本地歌单', dangerous: true, showDontAsk: true,
-      message: '“删除本地歌单”会删除所选歌单文件夹及其中的所有文件。如果想保留本地文件，请使用“暂停同步”。',
-      confirmText: '删除本地歌单', onConfirm: remove });
+    setModal({ type: 'confirm', title: onlyLibrary ? '移除歌单映射' : '删除本地歌单', dangerous: !onlyLibrary, showDontAsk: true,
+      message: onlyLibrary ? '移除音乐库根目录的歌单映射，保留音乐库中的全部文件。' : includesLibrary
+        ? '所选文件夹歌单只删除直属音频，保留子文件夹及其他文件；音乐库根目录歌单只移除映射，保留根目录全部文件。'
+        : '“删除本地歌单”只删除所选目录中的直属音频，保留子文件夹及其他文件；目录为空时一并移除。如果想保留全部歌曲，请使用“暂停同步”。',
+      confirmText: onlyLibrary ? '移除映射' : '删除本地歌单', onConfirm: remove });
   }
   function confirmCancel() {
     if (data.settings.cancelDontAsk) action('cancel', () => api.cancelTask(data.settings.cancelDeleteDownloaded), '同步任务已取消');
@@ -159,7 +209,10 @@ function App() {
   if (loading || !data) return <div className="loading-screen"><Logo /><span>正在启动本地同步服务…</span></div>;
   const selectedLocalRows = data.local.filter((row) => localSelected.has(row.id));
   const selectedAllPaused = selectedLocalRows.length && selectedLocalRows.every((row) => row.paused);
-  const hasUnsynced = data.local.some((row) => !row.paused && !row.offline && (row.added.length || row.removed.length));
+  const matchedSelected = data.local.filter((row) => syncScope.has(row.onlineId) && !row.paused && !row.offline);
+  const hasUnsynced = matchedSelected.some((row) => row.needsSync);
+  const selectionBlocked = Boolean(busy) || data.scanning || data.task.active;
+  const allVisibleSelected = onlineRows.length > 0 && onlineRows.every((row) => syncScope.has(row.id));
   const progress = taskPercent(data.task);
 
   return <div className="app-shell">
@@ -173,43 +226,56 @@ function App() {
 
     <main className="workspace">
       <section className="pane online-pane">
-        <PaneHeading eyebrow="ONLINE" title="在线歌单" count={data.online.length} />
+        <PaneHeading eyebrow="ONLINE" title="在线歌单" count={data.online.length} action={<button className="refresh-playlists" disabled={selectionBlocked} onClick={() => action('refresh', api.refresh, '歌单列表已刷新')}><span>↻</span> 刷新歌单</button>} />
         <Search value={onlineSearch} onChange={setOnlineSearch} placeholder={`在 ${onlineTab === 'created' ? '创建的歌单' : '收藏的歌单'} 中搜索`} />
         <div className="tabs">
           {['created','saved'].map((tab) => <button key={tab} className={onlineTab === tab ? 'active' : ''} onClick={() => setOnlineTab(tab)}>
             <span>{tab === 'created' ? '创建的歌单' : '收藏的歌单'} <b>{onlineCounts[tab]}</b></span><small className={`tab-selection-count ${onlineTab === tab ? '' : 'inactive'}`} aria-hidden={onlineTab !== tab}>已选：{onlineSelectedCounts[tab]}</small>
           </button>)}
         </div>
-        <div className="table-wrap" tabIndex="0" onKeyDown={(event) => tableKeyDown(event, onlineRows, setOnlineSelected)}>
+        <div className="playlist-selection-toolbar"><span>同步范围 <b>{syncScope.size}</b> 个歌单</span><div>
+          <button disabled={selectionBlocked || !onlineRows.length} onClick={() => choosePlaylists(onlineRows.map((row) => row.id), !allVisibleSelected)}>{allVisibleSelected ? '取消全选' : '全选当前列表'}</button>
+          <button disabled={selectionBlocked || !syncScope.size} onClick={() => choosePlaylists([...syncScope], false)}>清空选择</button>
+        </div></div>
+        <div ref={onlineWindow.viewport} className="table-wrap" tabIndex="0" onKeyDown={(event) => { if (event.ctrlKey && event.key.toLowerCase() === 'a') { event.preventDefault(); if (!selectionBlocked) choosePlaylists(onlineRows.map((row) => row.id), true); } }}>
           <table><thead><tr>
+            <th className="check-col"><input className="selection-checkbox" aria-label="选择当前列表的全部歌单" type="checkbox" checked={allVisibleSelected} disabled={selectionBlocked || !onlineRows.length} onChange={(event) => choosePlaylists(onlineRows.map((row) => row.id), event.target.checked)} /></th>
             <Sortable label="名称" sort={onlineSort} field="name" setSort={setOnlineSort} />
             <Sortable label="歌曲数" sort={onlineSort} field="trackCount" setSort={setOnlineSort} />
             <Sortable label="创建日期" sort={onlineSort} field="createdAt" setSort={setOnlineSort} />
           </tr></thead><tbody>
-            {onlineRows.map((item) => <tr key={item.id} className={onlineSelected.has(item.id) ? 'selected' : ''}
+            {onlineWindow.top > 0 && <tr className="virtual-spacer" aria-hidden="true"><td colSpan={4} style={{ height: onlineWindow.top }} /></tr>}
+            {onlineRows.slice(onlineWindow.start, onlineWindow.end).map((item) => <tr key={item.id} data-playlist-id={item.id} className={`${onlineSelected.has(item.id) ? 'selected' : ''} ${syncScope.has(item.id) ? 'sync-selected' : ''}`}
               onClick={(event) => toggleSelection(event, item, onlineRows, onlineSelected, setOnlineSelected, onlineAnchor)} onDoubleClick={() => showOnlineDetail(item)}>
-              <td><div className="name-cell"><span>{item.name}</span></div></td><td>{item.trackCount}</td><td>{date(item.createdAt)}</td>
+              <td className="check-col" onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()}><input className="selection-checkbox" aria-label={`同步歌单：${item.name}`} type="checkbox" checked={syncScope.has(item.id)} disabled={selectionBlocked} onChange={(event) => { setOnlineSelected(new Set([item.id])); choosePlaylists([item.id], event.target.checked); }} /></td>
+              <td><div className="name-cell"><span>{item.name}</span><small className={mappedOnlineIds.has(item.id) ? 'mapped-label' : 'unmapped-label'}>{mappedOnlineIds.has(item.id) ? '已映射' : '待匹配目录'}</small></div></td><td>{item.trackCount}</td><td>{date(item.createdAt)}</td>
             </tr>)}
-            {!onlineRows.length && <EmptyRow columns={3} text={data.settings.userId ? '没有匹配的在线歌单' : '请先在设置中填写用户 ID'} />}
+            {onlineWindow.bottom > 0 && <tr className="virtual-spacer" aria-hidden="true"><td colSpan={4} style={{ height: onlineWindow.bottom }} /></tr>}
+            {!onlineRows.length && <EmptyRow columns={4} text={data.settings.userId ? '没有匹配的在线歌单' : '请先在设置中填写用户 ID'} />}
           </tbody></table>
         </div>
-        <button className="primary wide" disabled={!onlineSelected.size || busy || data.scanning} onClick={addSelected}>＋ 添加到本地歌单 <kbd>{onlineSelected.size || ''}</kbd></button>
+        <div className="online-footer"><button disabled={!syncScope.size || selectionBlocked} onClick={addSelected}>匹配所选歌单的现有目录</button>
+        <button className="map-online-button" disabled={onlineSelected.size !== 1 || busy || data.scanning || data.task.active} onClick={() => {
+          const onlineId = [...onlineSelected][0];
+          setModal({ type: 'mapping', onlineId, item: data.local.find((item) => item.onlineId === onlineId) });
+        }}>自定义映射到本地文件夹</button></div>
+        <p className="scope-help">只处理勾选的歌单 · 自动匹配同名子目录 · 不创建歌单文件夹</p>
       </section>
 
       <section className="sync-rail">
-        <div className="rail-line" />
-        <label className="realtime-switch" title="持续检测所有未暂停歌单，发现更新后立即下载"><span>实时同步</span><input aria-label="实时同步" type="checkbox" checked={Boolean(data.settings.realtimeSync)} disabled={busy === 'realtime'} onChange={(event) => toggleRealtime(event.target.checked)} /><i /></label>
+        <div className="sync-scope-summary"><strong>{syncScope.size}</strong><span>已选歌单</span><small>{matchedSelected.length} 个映射可用</small></div>
+        <label className="realtime-switch" title="只监测和同步左侧勾选的歌单"><span>实时同步</span><input aria-label="实时同步" type="checkbox" checked={Boolean(data.settings.realtimeSync)} disabled={selectionBlocked} onChange={(event) => toggleRealtime(event.target.checked)} /><i /></label>
         <div className={`sync-progress-ring ${data.task.active ? 'active' : ''} ${data.settings.realtimeSync && !data.task.active ? 'realtime' : ''}`}>
-          <svg className="progress-ring" viewBox="0 0 120 120" aria-hidden="true"><circle className="progress-ring-track" cx="60" cy="60" r="56" pathLength="100" /><circle className="progress-ring-value" cx="60" cy="60" r="56" pathLength="100" style={{ strokeDashoffset: 100 - progress }} /></svg>
-          <button className="sync-button" disabled={busy || data.task.active || data.scanning || !data.local.length} onClick={() => sync()}>
-            <span>⇄</span><strong>{data.settings.realtimeSync ? '实时同步中' : '一键同步'}</strong><small>{data.task.active ? `${Math.round(progress)}%` : data.settings.realtimeSync ? '持续监测歌单更新' : hasUnsynced ? '有更新待处理' : '检查并同步全部'}</small>
+          <button className="sync-button" disabled={selectionBlocked || !syncScope.size} onClick={() => sync()}>
+            <span>⇄</span><strong>{data.task.active ? '正在同步' : '同步所选'}</strong><small>{data.task.active ? `${Math.round(progress)}%` : hasUnsynced ? '有更新待处理' : '仅处理勾选歌单'}</small>
           </button>
+          {data.task.active && <div className="sync-linear-progress" role="progressbar" aria-label="同步进度" aria-valuenow={Math.round(progress)} aria-valuemin={0} aria-valuemax={100}><i style={{ width: `${progress}%` }} /></div>}
         </div>
         <div className="rail-task-controls">
           <button disabled={!data.task.active} onClick={() => action('task', data.task.paused ? api.resumeTask : api.pauseTask, data.task.paused ? '任务已继续' : '任务已暂停')}>{data.task.paused ? '▶ 继续任务' : 'Ⅱ 暂停任务'}</button>
           <button disabled={!data.task.active} onClick={confirmCancel}>× 取消任务</button>
         </div>
-        <div className="rail-line" />
+        <p className="rail-hint">未勾选的歌单保持原样</p>
       </section>
 
       <section className="pane local-pane">
@@ -225,21 +291,21 @@ function App() {
           </tr></thead><tbody>
             {localRows.map((item) => <tr key={item.id} className={localSelected.has(item.id) ? 'selected' : ''}
               onClick={(event) => toggleSelection(event, item, localRows, localSelected, setLocalSelected, localAnchor)} onDoubleClick={() => showLocalDetail(item)} onContextMenu={(event) => openContext(event, item)}>
-              <td><StatusBadge status={item.status} /></td>
-              <td><div className="local-name"><strong>{item.displayName}</strong>{item.pendingName && <button className="rename-hint" onClick={(event) => { event.stopPropagation(); action('rename', () => api.renameFolder(item.id), '文件夹已同步重命名'); }}>同步文件夹名称</button>}{item.syncProgress && <small>{item.syncProgress}</small>}</div></td>
+              <td><StatusBadge status={item.status} />{!syncScope.has(item.onlineId) && <small className="out-of-scope">未选择</small>}</td>
+              <td><div className="local-name"><strong>{item.displayName}</strong><span className="playlist-path" title={item.folderPath}>{item.folderPath}</span><button className="mapping-link" disabled={Boolean(busy) || data.task.active || data.scanning} onClick={(event) => { event.stopPropagation(); setModal({ type: 'mapping', item }); }}>修改映射</button>{item.pendingName && <button className="rename-hint" onClick={(event) => { event.stopPropagation(); action('rename', () => api.renameFolder(item.id), '文件夹已同步重命名'); }}>同步文件夹名称</button>}{item.syncProgress && <small>{item.syncProgress}</small>}</div></td>
               <td>{item.trackCount}</td><td><ChangeBadges item={item} /></td><td>{date(item.createdAt)}</td>
             </tr>)}
-            {!localRows.length && <EmptyRow columns={5} text="还没有本地歌单，从左侧选择后添加" />}
+            {!localRows.length && <EmptyRow columns={5} text="勾选在线歌单后匹配现有目录，或自定义映射" />}
           </tbody></table>
         </div>
         <div className="pane-actions">
           <button disabled={!localSelected.size || busy || data.task.active} onClick={pauseSelected}>{selectedAllPaused ? '▶ 恢复同步' : 'Ⅱ 暂停同步'}</button>
-          <button className="danger-ghost" disabled={!localSelected.size || busy} onClick={() => confirmRemove()}>− 删除本地歌单</button>
+          <button className="danger-ghost" disabled={!localSelected.size || busy} onClick={() => confirmRemove()}>{selectedLocalRows.length === 1 && selectedLocalRows[0].libraryRoot ? '− 移除映射' : '− 删除本地歌单'}</button>
         </div>
       </section>
     </main>
 
-    {context && <ContextMenu {...context} data={data} onClose={() => setContext(null)} onDetail={showLocalDetail} onSync={(item) => sync([item.id])} onPause={(item) => action('pause-local', () => api.pauseLocal([item.id], !item.paused), item.paused ? '歌单已恢复' : '歌单已暂停')} onRemove={(item) => confirmRemove([item.id])} onRedirect={(item) => setModal({ type: 'redirect', item })} onOpen={(item) => action('open', () => api.openFolder(item.id))} />}
+    {context && <ContextMenu {...context} data={data} onClose={() => setContext(null)} onDetail={showLocalDetail} onMap={(item) => setModal({ type: 'mapping', item })} onSync={(item) => sync([item.id])} onPause={(item) => action('pause-local', () => api.pauseLocal([item.id], !item.paused), item.paused ? '歌单已恢复' : '歌单已暂停')} onRemove={(item) => confirmRemove([item.id])} onRedirect={(item) => setModal({ type: 'redirect', item })} onOpen={(item) => action('open', () => api.openFolder(item.id))} />}
     {modal && <ModalRouter modal={modal} data={data} busy={busy} close={() => modal.type !== 'setup' && setModal(null)} setupUser={setupUser} action={action} />}
     {toast && <div className={`toast ${toast.type}`}>{toast.type === 'error' ? '!' : '✓'} {toast.message}</div>}
   </div>;
@@ -262,17 +328,18 @@ function Search({ value, onChange, placeholder }) { return <label className="sea
 function Sortable({ label, sort, field, setSort, className = '' }) { return <th className={className} onClick={() => setSort((old) => ({ key: field, direction: old.key === field ? -old.direction : 1 }))}>{label}{sort.key === field && <span className="sort">{sort.direction > 0 ? '↑' : '↓'}</span>}</th>; }
 function EmptyRow({ columns, text }) { return <tr className="empty-row"><td colSpan={columns}><span>◎</span>{text}</td></tr>; }
 function StatusBadge({ status }) { return <span className={`status-badge ${status}`}>{{synced:'同步',pending:'更新',paused:'暂停',offline:'离线'}[status]}</span>; }
-function ChangeBadges({ item }) { return <div className={`badges ${item.paused ? 'muted' : ''}`}>{item.added.length > 0 && <span className="plus">+{item.added.length}</span>}{item.removed.length > 0 && <span className="minus">−{item.removed.length}</span>}{!item.added.length && !item.removed.length && <span>—</span>}</div>; }
+function ChangeBadges({ item }) { return <div className={`badges ${item.paused ? 'muted' : ''}`}>{item.addedCount > 0 && <span className="plus">+{item.addedCount}</span>}{item.removedCount > 0 && <span className="minus">−{item.removedCount}</span>}{!item.addedCount && !item.removedCount && <span>—</span>}</div>; }
 
-function ContextMenu({ x, y, item, data, onClose, onDetail, onSync, onPause, onRemove, onRedirect, onOpen }) {
-  const syncDisabled = item.paused || item.offline || data.scanning || data.task.active;
+function ContextMenu({ x, y, item, data, onClose, onDetail, onSync, onPause, onRemove, onRedirect, onOpen, onMap }) {
+  const syncDisabled = item.paused || item.offline || data.scanning || data.task.active || !data.settings.syncPlaylistIds.includes(item.onlineId);
   const click = (fn) => () => { onClose(); fn(item); };
   return <div className="context-menu" style={{ left: Math.min(x, innerWidth - 230), top: Math.min(y, innerHeight - 300) }} onClick={(event) => event.stopPropagation()}>
     <button onClick={click(onOpen)}>▣ 打开文件夹</button><button onClick={click(onDetail)}>≡ 查看更新详情</button>
+    <button disabled={data.task.active || data.scanning} onClick={click(onMap)}>自定义映射</button>
     <button disabled={syncDisabled} onClick={click(onSync)}>⇄ 同步当前歌单</button><hr />
     {item.offline && <button onClick={click(onRedirect)}>↪ 重定向到在线歌单</button>}
     <button disabled={data.task.active} onClick={click(onPause)}>{item.paused ? '▶ 恢复同步' : 'Ⅱ 暂停同步'}</button>
-    <button className="danger" onClick={click(onRemove)}>− 删除本地歌单</button>
+    <button className="danger" onClick={click(onRemove)}>{item.libraryRoot ? '− 移除映射（保留文件）' : '− 删除本地歌单'}</button>
   </div>;
 }
 
@@ -294,9 +361,13 @@ function ModalRouter({ modal, data, busy, close, setupUser, action }) {
   }} />;
   if (modal.type === 'tracks') return <TracksModal title={modal.title} tracks={modal.tracks} close={close} />;
   if (modal.type === 'changes') {
-    const item = data.local.find((entry) => entry.id === modal.itemId);
-    return item ? <ChangesModal item={item} settings={data.settings} close={close} saveDelete={(checked) => action('setting-delete', () => api.saveSettings({ deleteRemoved: checked, scanHours: data.settings.scanHours, scanMinutes: data.settings.scanMinutes }), '删除策略已更新')} /> : null;
+    const live = data.local.find((entry) => entry.id === modal.item.id);
+    return live ? <PlaylistEditor item={modal.item} blocked={Boolean(busy) || data.task.active || data.scanning} syncDisabled={live.paused || live.offline || !data.settings.syncPlaylistIds.includes(live.onlineId)} close={close} Dialog={Dialog}
+      save={(revision, changes) => action('song-plan', () => api.saveChoices(live.id, revision, changes), '歌曲方案已保存')}
+      sync={() => action('sync', () => api.sync([live.id]), '当前歌单同步已开始')} /> : null;
   }
+  if (modal.type === 'mapping') return <MappingModal item={modal.item} onlineId={modal.onlineId} data={data} busy={busy} close={close} Dialog={Dialog} browse={browseLibrary}
+    submit={(onlineId, folderPath, localId) => action('mapping', () => api.mapPlaylist(onlineId, folderPath, localId), '歌单映射已保存')} />;
   if (modal.type === 'loading') return <Dialog title={modal.title} close={close}><div className="modal-loading"><span className="spinner" />正在读取歌单曲目…</div></Dialog>;
   if (modal.type === 'confirm') return <ConfirmDialog {...modal} busy={busy} close={close} />;
   if (modal.type === 'cancel-task') return <CancelTaskModal data={data} busy={busy} close={close} cancel={async (remove, dontAsk) => {
@@ -383,6 +454,7 @@ function SettingsModal({ data, busy, close, save }) {
     <div className="inline-fields"><label>周期（小时）<input type="number" min="0" value={form.scanHours} onChange={(event) => update('scanHours', event.target.value)} /></label><label>分钟<input type="number" min="0" value={form.scanMinutes} onChange={(event) => update('scanMinutes', event.target.value)} /></label></div>
     <Toggle label="扫描到更新后自动同步" checked={form.autoSync} onChange={(value) => update('autoSync', value)} />
     <label>下载并发数（同时下载的歌曲数）<select value={form.downloadConcurrency ?? 4} onChange={(event) => update('downloadConcurrency', Number(event.target.value))}>{[1,2,3,4,5,6,7,8].map((n) => <option key={n} value={n}>{n} 路</option>)}</select></label>
+    <label>MP3 导出码率<select value={form.mp3Bitrate ?? 0} onChange={(event) => update('mp3Bitrate', Number(event.target.value))}><option value={0}>保留源音质（MP3 / FLAC）</option>{[128,192,256,320].map((rate) => <option key={rate} value={rate}>{rate} kbps</option>)}</select><small className="hint">固定码率仅用于之后新下载的歌曲；本地已有和未勾选的歌曲保持原样。提高码率不会提升音源音质。</small></label>
     <Toggle label="同步时删除在线歌单中已减少的歌曲" checked={form.deleteRemoved} onChange={(value) => update('deleteRemoved', value)} />
     <label>在线歌单改名时<select value={form.renamePolicy || 'ask'} onChange={(event) => update('renamePolicy', event.target.value)}><option value="ask">提示后手动同步文件夹名</option><option value="auto">自动同步本地文件夹名</option></select></label>
     <Toggle label="取消任务时删除本次下载内容" checked={form.cancelDeleteDownloaded} onChange={(value) => update('cancelDeleteDownloaded', value)} />
@@ -401,19 +473,16 @@ function TrackList({ tracks, empty = '暂无歌曲', compact = false }) {
   const safePage = Math.min(page, pageCount - 1);
   useEffect(() => setPage(0), [tracks.length, tracks[0]?.id]);
   const start = safePage * pageSize;
-  const visible = tracks.slice(start, start + pageSize);
-  return <div className="track-list-frame"><div className={`track-list ${compact ? 'compact' : ''}`}>{tracks.length ? visible.map((track, index) => <div key={track.id}><span>{String(start + index + 1).padStart(2, '0')}</span><strong>{track.name || `歌曲 ${track.id}`}</strong><em>{(track.artists || []).join(', ') || '未知艺术家'}</em><small>{duration(track.duration)}</small></div>) : <p className="empty-state">{empty}</p>}</div>{pageCount > 1 && <nav className="track-pagination" aria-label="曲目分页"><button disabled={safePage === 0} onClick={() => setPage((value) => Math.max(0, value - 1))}>上一页</button><span>{safePage + 1} / {pageCount} · {tracks.length} 首</span><button disabled={safePage >= pageCount - 1} onClick={() => setPage((value) => Math.min(pageCount - 1, value + 1))}>下一页</button></nav>}</div>;
+  const pageTracks = tracks.slice(start, start + pageSize);
+  const window = useVirtualWindow(pageTracks.length, 42, `${safePage}:${tracks[0]?.id}`);
+  const visible = pageTracks.slice(window.start, window.end);
+  return <div className="track-list-frame"><div ref={window.viewport} className={`track-list ${compact ? 'compact' : ''}`}>
+    {window.top > 0 && <div className="virtual-spacer" aria-hidden="true" style={{ height: window.top }} />}
+    {tracks.length ? visible.map((track, index) => <div key={track.id} data-track-id={track.id}><span>{String(start + window.start + index + 1).padStart(2, '0')}</span><strong>{track.name || `歌曲 ${track.id}`}</strong><em>{(track.artists || []).join(', ') || '未知艺术家'}</em><small>{duration(track.duration)}</small></div>) : <p className="empty-state">{empty}</p>}
+    {window.bottom > 0 && <div className="virtual-spacer" aria-hidden="true" style={{ height: window.bottom }} />}
+  </div>{pageCount > 1 && <nav className="track-pagination" aria-label="曲目分页"><button disabled={safePage === 0} onClick={() => setPage((value) => Math.max(0, value - 1))}>上一页</button><span>{safePage + 1} / {pageCount} · {tracks.length} 首</span><button disabled={safePage >= pageCount - 1} onClick={() => setPage((value) => Math.min(pageCount - 1, value + 1))}>下一页</button></nav>}</div>;
 }
 function TracksModal({ title, tracks, close }) { return <Dialog title={title} subtitle={`${tracks.length} 首歌曲`} close={close} wide><TrackList tracks={tracks} /></Dialog>; }
-function ChangesModal({ item, settings, close, saveDelete }) {
-  const [checked, setChecked] = useState(settings.deleteRemoved);
-  const columns = [
-    { key: 'added', title: '新增歌曲', count: `+${item.added.length}`, empty: '没有新增歌曲' },
-    { key: 'removed', title: '减少歌曲', count: `−${item.removed.length}`, empty: '没有减少歌曲', danger: true },
-    { key: 'existing', title: '本地已有', count: item.existing.length, empty: '尚无已同步歌曲' }
-  ];
-  return <Dialog title={item.displayName} subtitle="本地与在线歌单差异" close={close} extraWide><div className="changes-grid">{columns.map((column) => <section key={column.key}><h4>{column.title} <b className={column.danger ? 'red' : ''}>{column.count}</b></h4><TrackList tracks={item[column.key]} empty={column.empty} compact /></section>)}</div><label className="delete-check"><input type="checkbox" checked={checked} onChange={(event) => { setChecked(event.target.checked); saveDelete(event.target.checked); }} /> 同步时一并删除减少的歌曲</label></Dialog>;
-}
 function ConfirmDialog({ title, message, confirmText, dangerous, showDontAsk, onConfirm, busy, close }) { const [dontAsk, setDontAsk] = useState(false); return <Dialog title={title} close={close}><div className="confirm-content"><div className={dangerous ? 'warning-icon' : 'info-icon'}>!</div><p>{message}</p></div>{showDontAsk && <label className="delete-check"><input type="checkbox" checked={dontAsk} onChange={(event) => setDontAsk(event.target.checked)} /> 下次不再询问</label>}<div className="modal-actions"><button onClick={close}>取消</button><button className={dangerous ? 'danger-button' : 'primary'} disabled={busy} onClick={() => onConfirm(dontAsk)}>{confirmText || '确认'}</button></div></Dialog>; }
 function CancelTaskModal({ data, busy, close, cancel }) { const [remove, setRemove] = useState(data.settings.cancelDeleteDownloaded); const [dontAsk, setDontAsk] = useState(false); return <Dialog title="取消当前同步任务" close={close}><p className="dialog-copy">是否删除本次任务中已经下载并链接到歌单的内容？</p><label className="choice"><input type="radio" checked={remove} onChange={() => setRemove(true)} /> 删除本次下载内容</label><label className="choice"><input type="radio" checked={!remove} onChange={() => setRemove(false)} /> 保留已下载内容</label><label className="delete-check"><input type="checkbox" checked={dontAsk} onChange={(event) => setDontAsk(event.target.checked)} /> 下次不再询问</label><div className="modal-actions"><button onClick={close}>继续同步</button><button className="danger-button" disabled={busy} onClick={() => cancel(remove, dontAsk)}>取消任务</button></div></Dialog>; }
 function RedirectModal({ item, online, busy, close, submit }) {
@@ -424,6 +493,21 @@ function RedirectModal({ item, online, busy, close, submit }) {
 }
 
 function taskPercent(task) { if (!task.total) return 0; const perPlaylist = 100 / task.total; const trackPart = task.downloadTotal ? task.downloaded / task.downloadTotal : 1; return Math.min(100, ((task.current - 1) + trackPart) * perPlaylist); }
-function statusText(data) { if (!data.settings.userId) return '当前未设置用户 ID，请先设置后使用同步功能'; if (data.task.error) return data.task.error; if (data.task.active) { const source = data.task.source === 'realtime' ? '实时同步' : data.task.source === 'auto' ? '自动同步' : '正在同步'; return data.task.paused ? `${source}任务已暂停` : `${source} ${data.task.current}/${data.task.total} 个歌单 · ${data.task.downloaded}/${data.task.downloadTotal}（并行 ${data.task.activeDownloads || 0}/${data.task.concurrency || 1}）`; } if (data.scanning) return data.scanStatus || '正在扫描本地与在线歌单差异…'; if (/失败|取消|中断|请重新/.test(data.scanStatus)) return data.scanStatus; const pending = data.local.filter((row) => row.status === 'pending').length; if (pending) return `${pending} 个歌单有更新待同步`; if (data.settings.realtimeSync) return '实时同步正在监测所有未暂停歌单'; return data.lastScanAt || data.lastSyncAt ? '所有本地歌单已同步' : '等待首次扫描'; }
+function statusText(data) {
+  if (!data.settings.userId) return '请先设置网易云用户 ID';
+  if (data.task.error) return data.task.error;
+  if (data.task.active) {
+    const source = data.task.source === 'realtime' ? '实时同步' : data.task.source === 'auto' ? '自动同步' : '正在同步';
+    return data.task.paused ? `${source}任务已暂停` : `${source} ${data.task.current}/${data.task.total} 个歌单 · ${data.task.downloaded}/${data.task.downloadTotal} 首`;
+  }
+  if (data.scanning) return data.scanStatus || '正在检查所选歌单…';
+  const scope = new Set(data.settings.syncPlaylistIds);
+  if (!scope.size) return '勾选左侧歌单，选择你的同步范围';
+  if (/失败|取消|中断|请重新/.test(data.scanStatus)) return data.scanStatus;
+  const pending = data.local.filter((row) => scope.has(row.onlineId) && row.status === 'pending').length;
+  if (pending) return `${pending} 个所选歌单有更新待同步`;
+  if (data.settings.realtimeSync) return '实时同步正在监测所选歌单';
+  return `已选 ${scope.size} 个歌单，点击同步所选开始`;
+}
 
 createRoot(document.getElementById('root')).render(<React.StrictMode><App /></React.StrictMode>);
